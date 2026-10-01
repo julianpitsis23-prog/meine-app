@@ -584,8 +584,17 @@
     <div class="block-label">📷 Barcode Scanner</div>
     <button class="btn-red" onclick="startScanner()" id="scannerBtn">BARCODE SCANNEN</button>
     <div id="scannerWrap" style="display:none;margin-top:12px;">
-      <video id="scannerVideo" style="width:100%;border-radius:8px;background:#000;" autoplay muted playsinline></video>
-      <p style="font-size:12px;color:var(--dim);text-align:center;margin-top:8px;">Halte die Kamera auf den Strichcode der Verpackung</p>
+      <div id="scannerView" style="position:relative;border-radius:8px;overflow:hidden;background:#000;">
+        <video id="scannerVideo" style="width:100%;aspect-ratio:4/3;object-fit:cover;display:block;" autoplay muted playsinline></video>
+        <div style="position:absolute;left:8%;right:8%;top:28%;bottom:28%;border:2px solid rgba(255,255,255,.7);border-radius:10px;pointer-events:none;"></div>
+        <div style="position:absolute;left:8%;right:8%;top:50%;height:2px;background:var(--red);box-shadow:0 0 8px var(--red);pointer-events:none;"></div>
+      </div>
+      <p id="scannerStatus" style="font-size:12px;color:var(--dim);text-align:center;margin-top:8px;">Strichcode waagrecht in den Rahmen halten (ca. 10–20 cm Abstand)</p>
+      <div style="margin-top:10px;">
+        <label class="fl">Oder Barcode-Nummer manuell eingeben</label>
+        <input type="text" inputmode="numeric" pattern="[0-9]*" id="manualBarcode" placeholder="z.B. 7610395000014" style="margin-bottom:8px" />
+        <button onclick="searchManualBarcode()" class="btn-red">SUCHEN</button>
+      </div>
       <button onclick="stopScanner()" style="width:100%;margin-top:8px;padding:12px;background:var(--surf2);border:1px solid var(--line);color:var(--dim);font-size:14px;font-weight:600;border-radius:8px;cursor:pointer;">Abbrechen</button>
     </div>
     <div id="scannerResult" style="display:none;margin-top:12px;background:var(--surf2);border:1px solid var(--green);border-radius:8px;padding:14px;">
@@ -1066,51 +1075,274 @@ function renderQuickTemplates() {
   makeGrid(QUICK_CARBS,'quickCarbs');
 }
 
+// <EAN-DECODER>
+// ── EAN/UPC-DECODER (reines JS, keine Bibliothek, läuft in Safari) ──
+const EANScan=(function(){
+  // Breiten der 4 Streifen pro Ziffer (L-Code; R-Code identisch, G-Code = umgekehrt)
+  const W=[[3,2,1,1],[2,2,2,1],[2,1,2,2],[1,4,1,1],[1,1,3,2],[1,2,3,1],[1,1,1,4],[1,3,1,2],[1,2,1,3],[3,1,1,2]];
+  const G=W.map(p=>p.slice().reverse());
+  const PARITY=['LLLLLL','LLGLGG','LLGGLG','LLGGGL','LGLLGG','LGGLLG','LGGGLL','LGLGLG','LGLGGL','LGGLGL'];
+  const MAXV=0.48;
+  const G3=[1,1,1], G5=[1,1,1,1,1];
+
+  function variance(w,i,pat){
+    let total=0, psum=0;
+    for(let k=0;k<pat.length;k++){ total+=w[i+k]; psum+=pat[k]; }
+    if(total<psum) return Infinity;
+    const unit=total/psum, maxInd=0.7*unit;
+    let tv=0;
+    for(let k=0;k<pat.length;k++){
+      const v=Math.abs(w[i+k]-pat[k]*unit);
+      if(v>maxInd) return Infinity;
+      tv+=v;
+    }
+    return tv/total;
+  }
+
+  function checksumOk(d){
+    let s=0;
+    for(let i=d.length-2, wgt=3; i>=0; i--, wgt=(wgt===3?1:3)) s+=d[i]*wgt;
+    return ((10-(s%10))%10)===d[d.length-1];
+  }
+
+  function bestDigit(w,pos,tables){
+    let best=Infinity, bi=-1, bt=0;
+    for(let t=0;t<tables.length;t++){
+      for(let k=0;k<10;k++){
+        const v=variance(w,pos,tables[t][k]);
+        if(v<best){ best=v; bi=k; bt=t; }
+      }
+    }
+    return best<MAXV ? {d:bi,t:bt} : null;
+  }
+
+  // w = Streifenbreiten, s = Index eines schwarzen Streifens (Start-Guard)
+  function decodeAt(w,s,ean8){
+    const nd=ean8?4:6, need=ean8?43:59;
+    if(s+need>w.length || s<1) return null;
+    if(variance(w,s,G3)>=MAXV) return null;
+    const u=(w[s]+w[s+1]+w[s+2])/3;
+    if(w[s-1]<u*2.5) return null;                  // Ruhezone davor
+    let pos=s+3, digits=[], parity='';
+    for(let i=0;i<nd;i++){
+      const r=bestDigit(w,pos,ean8?[W]:[W,G]);
+      if(!r) return null;
+      digits.push(r.d); parity+=(r.t===1?'G':'L'); pos+=4;
+    }
+    if(variance(w,pos,G5)>=MAXV) return null;
+    pos+=5;
+    for(let i=0;i<nd;i++){
+      const r=bestDigit(w,pos,[W]);
+      if(!r) return null;
+      digits.push(r.d); pos+=4;
+    }
+    if(variance(w,pos,G3)>=MAXV) return null;
+    pos+=3;
+    if(pos>=w.length || w[pos]<u*2.5) return null;   // Ruhezone dahinter
+    if(!ean8){
+      const first=PARITY.indexOf(parity);
+      if(first<0) return null;
+      digits.unshift(first);
+    }
+    if(!checksumOk(digits)) return null;
+    return digits.join('');
+  }
+
+  function decodeRuns(w,firstBlack){
+    for(let dir=0;dir<2;dir++){
+      let ww=w, fb=firstBlack;
+      if(dir===1){ ww=w.slice().reverse(); fb=((w.length-1)%2===0)===firstBlack; }
+      for(let s=(fb?0:1); s<ww.length-42; s+=2){
+        const a=decodeAt(ww,s,false); if(a) return a;
+        const b=decodeAt(ww,s,true);  if(b) return b;
+      }
+    }
+    return null;
+  }
+
+  // Helligkeitswerte einer Zeile -> Streifenbreiten (Subpixel) mit lokaler Schwelle
+  function lineToRuns(sig,n){
+    const sm=new Float32Array(n);
+    for(let i=0;i<n;i++){
+      sm[i]=(sig[i>0?i-1:0]+2*sig[i]+sig[i<n-1?i+1:n-1])/4;
+    }
+    const B=Math.max(16,Math.round(n/14)), nb=Math.ceil(n/B);
+    const bmin=new Float32Array(nb).fill(255), bmax=new Float32Array(nb);
+    for(let i=0;i<n;i++){
+      const b=(i/B)|0;
+      if(sm[i]<bmin[b]) bmin[b]=sm[i];
+      if(sm[i]>bmax[b]) bmax[b]=sm[i];
+    }
+    const thr=new Float32Array(n);
+    for(let i=0;i<n;i++){
+      const b=(i/B)|0;
+      let lo=255, hi=0;
+      for(let k=b-1;k<=b+1;k++){
+        if(k<0||k>=nb) continue;
+        if(bmin[k]<lo) lo=bmin[k];
+        if(bmax[k]>hi) hi=bmax[k];
+      }
+      thr[i]=(hi-lo<20) ? -1 : (lo+hi)/2;          // flache Fläche = weiss
+    }
+    const firstBlack=sm[0]<thr[0];
+    let state=firstBlack, last=0;
+    const w=[];
+    for(let i=1;i<n;i++){
+      const black=sm[i]<thr[i];
+      if(black!==state){
+        const t=(thr[i-1]+thr[i])/2, a=sm[i-1], b=sm[i];
+        let f=(b!==a)?(t-a)/(b-a):0.5; if(f<0) f=0; if(f>1) f=1;
+        const pos=i-1+f;
+        w.push(pos-last); last=pos; state=black;
+      }
+    }
+    w.push(n-1-last);
+    // Störungen (winzige Streifen) mit den Nachbarn verschmelzen
+    let changed=true;
+    while(changed){
+      changed=false;
+      for(let i=1;i<w.length-1;i++){
+        if(w[i]<0.75){ w.splice(i-1,3,w[i-1]+w[i]+w[i+1]); changed=true; break; }
+      }
+    }
+    return {w,firstBlack};
+  }
+
+  const ANGLES=[0,180,10,170,20,160,90,80,100,30,150,70,110,40,140,60,120,50,130].map(a=>a%180);
+  const OFFSETS=[0,-0.06,0.06,-0.12,0.12,-0.18,0.18,-0.24,0.24];
+  const ANGLES_UNIQ=Array.from(new Set(ANGLES));
+
+  // gray: Uint8Array (width*height). Gibt Liste gefundener Codes zurück.
+  function decode(gray,width,height){
+    const found=[];
+    const cx=(width-1)/2, cy=(height-1)/2;
+    const base=Math.min(width,height);
+    const buf=new Float32Array(Math.ceil(Math.hypot(width,height))+4);
+    for(const deg of ANGLES_UNIQ){
+      const rad=deg*Math.PI/180, dx=Math.cos(rad), dy=Math.sin(rad), nx=-dy, ny=dx;
+      for(const off of OFFSETS){
+        const px=cx+nx*off*base, py=cy+ny*off*base;
+        // Linie am Bildrand abschneiden
+        let t0=-1e9, t1=1e9, ok=true;
+        if(Math.abs(dx)>1e-9){ let a=(0-px)/dx, b=(width-1-px)/dx; if(a>b){const t=a;a=b;b=t;} t0=Math.max(t0,a); t1=Math.min(t1,b); }
+        else if(px<0||px>width-1) ok=false;
+        if(Math.abs(dy)>1e-9){ let a=(0-py)/dy, b=(height-1-py)/dy; if(a>b){const t=a;a=b;b=t;} t0=Math.max(t0,a); t1=Math.min(t1,b); }
+        else if(py<0||py>height-1) ok=false;
+        if(!ok||t1-t0<100) continue;
+        const n=Math.min(buf.length,Math.floor(t1-t0));
+        for(let i=0;i<n;i++){
+          const x=px+dx*(t0+i), y=py+dy*(t0+i);
+          const x0=x|0, y0=y|0, fx=x-x0, fy=y-y0;
+          const x1=x0<width-1?x0+1:x0, y1=y0<height-1?y0+1:y0;
+          const p=y0*width+x0, q=y1*width+x0;
+          buf[i]=(gray[p]*(1-fx)+gray[p-x0+x1]*fx)*(1-fy)+(gray[q]*(1-fx)+gray[q-x0+x1]*fx)*fy;
+        }
+        const r=lineToRuns(buf,n);
+        const code=decodeRuns(r.w,r.firstBlack);
+        if(code) found.push(code);
+      }
+    }
+    return found;
+  }
+
+  return {decode};
+})();
+// </EAN-DECODER>
+
 // ── BARCODE SCANNER ──
-let scannerStream=null, scannerInterval=null, scannerBase={p:0,c:0,f:0,k:0};
+let scannerStream=null, scannerTimer=null, scannerHits={}, scannerBase={p:0,c:0,f:0,k:0};
+let scanDetector=null, scanDetErrors=0, scanCanvas=null, scanCtx=null, scanGray=null;
+
+function setScannerStatus(txt,color) {
+  const el=$('scannerStatus');
+  if(el) { el.textContent=txt; el.style.color=color||'var(--dim)'; }
+}
 
 async function startScanner() {
   $('scannerWrap').style.display='block';
   $('scannerResult').style.display='none';
   $('scannerBtn').style.display='none';
+  $('scannerView').style.display='block';
+  $('manualBarcode').value='';
+  scannerHits={}; scanDetErrors=0; scanDetector=null;
+  setScannerStatus('Kamera wird gestartet…');
   try {
-    scannerStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});
+    scannerStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
     const video=$('scannerVideo');
     video.srcObject=scannerStream;
     await video.play();
-    // Use BarcodeDetector if available (Chrome/Android), fallback message for Safari
+    setScannerStatus('Strichcode waagrecht in den Rahmen halten (ca. 10–20 cm Abstand)');
+    // Chrome/Android: eingebauter Scanner. Safari/iPhone: eigener Decoder (EANScan).
     if('BarcodeDetector' in window) {
-      const detector=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','code_39']});
-      scannerInterval=setInterval(async()=>{
-        try {
-          const barcodes=await detector.detect(video);
-          if(barcodes.length>0) { clearInterval(scannerInterval); await fetchProduct(barcodes[0].rawValue); }
-        } catch(e){}
-      },500);
-    } else {
-      // Safari fallback: manual input
-      $('scannerVideo').style.display='none';
-      $('scannerWrap').innerHTML+=`
-        <div style="margin-top:10px;">
-          <p style="font-size:13px;color:var(--orange);margin-bottom:8px;">⚠️ Automatisches Scannen wird in Safari nicht unterstützt. Barcode-Nummer manuell eingeben:</p>
-          <input type="number" id="manualBarcode" placeholder="z.B. 7610395000014" style="margin-bottom:8px" />
-          <button onclick="fetchProduct(document.getElementById('manualBarcode').value)" class="btn-red">SUCHEN</button>
-        </div>`;
+      try { scanDetector=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','code_39']}); } catch(e) { scanDetector=null; }
     }
+    scannerTick();
   } catch(e) {
-    stopScanner();
-    alert('Kamera-Zugriff verweigert. Bitte in den iPhone-Einstellungen erlauben.');
+    stopCamera();
+    $('scannerView').style.display='none';
+    setScannerStatus(e && e.name==='NotAllowedError'
+      ? '⚠️ Kamera-Zugriff verweigert. Bitte in den iPhone-Einstellungen erlauben oder die Nummer unten manuell eingeben.'
+      : '⚠️ Kamera nicht verfügbar. Bitte die Nummer unten manuell eingeben.','var(--orange)');
   }
 }
 
-function stopScanner() {
+// Ein Kamerabild mit dem eigenen Decoder lesen; Code gilt erst nach mehreren übereinstimmenden Treffern
+function readFrameWithOwnDecoder(video) {
+  const vw=video.videoWidth, vh=video.videoHeight;
+  const sc=Math.min(1,1280/Math.max(vw,vh));
+  const cw=Math.round(vw*sc), ch=Math.round(vh*sc);
+  if(!scanCanvas) { scanCanvas=document.createElement('canvas'); scanCtx=scanCanvas.getContext('2d',{willReadFrequently:true}); }
+  if(scanCanvas.width!==cw||scanCanvas.height!==ch) { scanCanvas.width=cw; scanCanvas.height=ch; scanGray=new Uint8Array(cw*ch); }
+  scanCtx.drawImage(video,0,0,cw,ch);
+  const px=scanCtx.getImageData(0,0,cw,ch).data;
+  for(let i=0,j=0;j<scanGray.length;i+=4,j++) scanGray[j]=(px[i]*77+px[i+1]*150+px[i+2]*29)>>8;
+  for(const c of EANScan.decode(scanGray,cw,ch)) scannerHits[c]=(scannerHits[c]||0)+1;
+  const top=Object.entries(scannerHits).sort((a,b)=>b[1]-a[1]);
+  if(top.length && top[0][1]>=2 && top[0][1]>=2*(top[1]?top[1][1]:0)) return top[0][0];
+  return null;
+}
+
+async function scannerTick() {
+  if(!scannerStream) return;
+  const video=$('scannerVideo');
+  let code=null;
+  if(video.readyState>=2 && video.videoWidth>0) {
+    try {
+      if(scanDetector) {
+        const r=await scanDetector.detect(video);
+        if(r.length>0) code=r[0].rawValue;
+      } else {
+        code=readFrameWithOwnDecoder(video);
+      }
+    } catch(e) {
+      if(scanDetector && ++scanDetErrors>=3) scanDetector=null;   // eingebauter Scanner defekt -> eigener Decoder
+    }
+  }
+  if(!scannerStream) return;      // wurde währenddessen abgebrochen
+  if(code) { await fetchProduct(code); return; }
+  scannerTimer=setTimeout(scannerTick, scanDetector?400:90);
+}
+
+function stopCamera() {
   if(scannerStream) { scannerStream.getTracks().forEach(t=>t.stop()); scannerStream=null; }
-  if(scannerInterval) { clearInterval(scannerInterval); scannerInterval=null; }
+  if(scannerTimer) { clearTimeout(scannerTimer); scannerTimer=null; }
+  const v=$('scannerVideo'); if(v) v.srcObject=null;
+}
+
+function stopScanner() {
+  stopCamera();
   $('scannerWrap').style.display='none';
   $('scannerBtn').style.display='block';
 }
 
+function searchManualBarcode() {
+  const code=($('manualBarcode').value||'').replace(/\D/g,'');
+  if(code.length<8||code.length>14) { setScannerStatus('⚠️ Bitte eine gültige Nummer mit 8–13 Ziffern eingeben.','var(--orange)'); return; }
+  fetchProduct(code);
+}
+
 async function fetchProduct(barcode) {
+  barcode=String(barcode||'').replace(/\D/g,'');
   stopScanner();
   $('scannerResult').style.display='block';
   $('scannerProductName').textContent='⏳ Produkt wird gesucht…';
